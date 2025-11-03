@@ -1,0 +1,12 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Generated model files
+*.pth
+
+# HMM Oracles (also large binary artifacts)
+*.pkl
+
+# Training plot
+*.png
