@@ -4,14 +4,17 @@ import numpy as np
 import pickle
 import string
 import random
-from collections import defaultdict
+from collections import defaultdict, Counter
 from scipy.special import logsumexp
 import torch
 
-# --- Helper function to load corpus ---
-def load_corpus_list(filepath="corpus.txt"):
+# --- NEW: Load corpus, max_len, AND frequencies ---
+def _load_corpus_and_frequencies(filepath="corpus.txt"):
     words = []
     max_len = 0
+    letter_counts = Counter()
+    total_letters = 0
+    
     try:
         with open(filepath, 'r') as f:
             for line in f:
@@ -20,13 +23,21 @@ def load_corpus_list(filepath="corpus.txt"):
                     words.append(word)
                     if len(word) > max_len:
                         max_len = len(word)
+                    for char in word:
+                        letter_counts[char] += 1
+                        total_letters += 1
     except FileNotFoundError:
         print(f"Error: {filepath} not found.")
-        return None, 0
-    return words, max_len
+        return None, 0, None
+        
+    # Create the frequency probability vector (A-Z)
+    freq_vector = np.zeros(26)
+    for i, char in enumerate(string.ascii_uppercase):
+        freq_vector[i] = letter_counts[char] / total_letters
+        
+    return words, max_len, freq_vector
 
-# --- Manual Forward-Backward Implementation (No Changes) ---
-
+# --- Manual Forward-Backward Implementation (Unchanged) ---
 def _log_forward_pass(log_framelogprob, log_startprob, log_transmat):
     n_observations, n_components = log_framelogprob.shape
     log_alpha = np.zeros((n_observations, n_components))
@@ -44,9 +55,6 @@ def _log_backward_pass(log_framelogprob, log_startprob, log_transmat):
             log_beta[t, i] = logsumexp(log_transmat[i, :] + log_framelogprob[t+1, :] + log_beta[t+1, :])
     return log_beta
 
-# --- END Manual Fwd/Bwd ---
-
-
 class HangmanEnv(gym.Env):
     
     def __init__(self, oracle_path="hmm_oracles.pkl", corpus_path="corpus.txt"):
@@ -54,7 +62,6 @@ class HangmanEnv(gym.Env):
         
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # --- Load HMM Oracles ---
         print("Loading HMM Oracles...")
         try:
             with open(oracle_path, 'rb') as f:
@@ -63,45 +70,43 @@ class HangmanEnv(gym.Env):
             raise
         print(f"Successfully loaded {len(self.hmm_oracles)} HMM models.")
         
-        # --- Load Corpus & Get Max Length ---
-        self.word_list, self.max_word_len = load_corpus_list(corpus_path)
+        # --- NEW: Load all corpus data ---
+        self.word_list, self.max_word_len, self.freq_vector = _load_corpus_and_frequencies(corpus_path)
         if not self.word_list:
-            raise ValueError("Corpus list is empty. Check corpus.txt.")
-        print(f"Loaded {len(self.word_list)} words for the game. Max length: {self.max_word_len}")
+            raise ValueError("Corpus list is empty.")
+        print(f"Loaded {len(self.word_list)} words. Max length: {self.max_word_len}. Frequencies calculated.")
 
-        # --- Game Constants ---
         self.max_lives = 6
         self.alphabet = string.ascii_uppercase
         self.n_letters = len(self.alphabet) # 26
+        self.letter_encoding_size = self.n_letters + 1 # 27 (A-Z + BLANK)
         
-        # --- *** NEW: State Space Encoding *** ---
-        # We need an encoding for 27 "letters": A-Z (0-25) and BLANK (26)
-        self.letter_encoding_size = self.n_letters + 1 # 27
-        
-        # --- *** NEW: Define Action and Observation Space *** ---
+        # --- NEW: Final State Space Definition ---
         self.action_space = spaces.Discrete(self.n_letters)
 
         # Observation (State) Space:
         # 1. Lives left (normalized)   : 1 element
         # 2. Guessed mask (binary)     : 26 elements
         # 3. HMM probabilities (float) : 26 elements
-        # 4. Masked Word (one-hot)     : max_word_len * 27 elements
-        # Total = 1 + 26 + 26 + (max_word_len * 27)
+        # 4. Freq probabilities (float): 26 elements  <--- NEW
+        # 5. Masked Word (one-hot)     : max_word_len * 27 elements
         
-        # Let's find the max_len from the corpus
-        self.state_size = 1 + self.n_letters + self.n_letters + (self.max_word_len * self.letter_encoding_size)
+        self.stats_size = 1 + self.n_letters + self.n_letters + self.n_letters # 1 + 26 + 26 + 26 = 79
+        self.word_size = self.max_word_len * self.letter_encoding_size # e.g., 24 * 27 = 648
+        self.state_size = self.stats_size + self.word_size # 79 + 648 = 727
         
         self.observation_space = spaces.Box(
             low=0.0, high=1.0, shape=(self.state_size,), dtype=np.float32
         )
-        print(f"New state vector size: {self.state_size}")
+        print(f"Final state vector size: {self.state_size} (Stats: {self.stats_size}, Word: {self.word_size})")
 
-        # --- Initialize Game State Variables ---
+        # Init game state
         self.secret_word = ""
         self.masked_word = ""
         self.lives_left = 0
         self.guessed_letters = set()
         
+        # Init HMM state
         self.log_startprob = None
         self.log_transmat = None
         self.log_emissionprob = None
@@ -131,7 +136,6 @@ class HangmanEnv(gym.Env):
             log_fwd = _log_forward_pass(log_framelogprob, self.log_startprob, self.log_transmat)
             log_bwd = _log_backward_pass(log_framelogprob, self.log_startprob, self.log_transmat)
         except Exception as e:
-            print(f"Warning: Manual HMM Fwd/Bwd failed: {e}. Returning uniform probs.")
             return np.ones(self.n_letters) / self.n_letters 
 
         log_gamma = log_fwd + log_bwd
@@ -165,7 +169,7 @@ class HangmanEnv(gym.Env):
 
     def _get_state(self):
         """
-        Constructs the new, LARGER state vector.
+        Constructs the FINAL state vector.
         """
         # 1. Lives (normalized)
         lives_vec = np.array([self.lives_left / self.max_lives], dtype=np.float32)
@@ -178,28 +182,32 @@ class HangmanEnv(gym.Env):
         # 3. HMM probabilities
         hmm_probs = self._get_hmm_probs().astype(np.float32)
         
-        # 4. --- NEW: One-hot encoded masked word ---
-        # (max_word_len, 27) one-hot matrix, then flattened
-        word_encoding = np.zeros((self.max_word_len, self.letter_encoding_size), dtype=np.float32)
+        # 4. --- NEW: Frequency probabilities ---
+        # We copy the base frequency vector
+        freq_probs = np.copy(self.freq_vector).astype(np.float32)
+        # We mask out guessed letters so the agent doesn't have to learn this
+        freq_probs[guessed_vec == 1] = 0
+        # Re-normalize
+        freq_sum = freq_probs.sum()
+        if freq_sum > 0:
+            freq_probs = freq_probs / freq_sum
         
+        # 5. --- NEW: One-hot encoded masked word ---
+        word_encoding = np.zeros((self.max_word_len, self.letter_encoding_size), dtype=np.float32)
         for i, char in enumerate(self.masked_word):
             if char == '_':
                 word_encoding[i, 26] = 1.0 # Index 26 is for BLANK
             else:
                 word_encoding[i, ord(char) - ord('A')] = 1.0
-        
-        # Pad the rest of the word (for words shorter than max_len)
         for i in range(len(self.masked_word), self.max_word_len):
             word_encoding[i, 26] = 1.0 # Pad with BLANK
-            
         word_vec = word_encoding.flatten()
         
-        # Concatenate all parts
-        state = np.concatenate([lives_vec, guessed_vec, hmm_probs, word_vec])
+        # Concatenate all parts (Stats Tower first, then Word Tower)
+        state = np.concatenate([lives_vec, guessed_vec, hmm_probs, freq_probs, word_vec])
         return state
 
     def reset(self, seed=None):
-        # (This function is modified to get the HMM parameters)
         super().reset(seed=seed)
         
         self.secret_word = random.choice(self.word_list)
@@ -220,7 +228,6 @@ class HangmanEnv(gym.Env):
         self.log_startprob[self.log_startprob == -np.inf] = log_floor
         self.log_transmat[self.log_transmat == -np.inf] = log_floor
         self.log_emissionprob[self.log_emissionprob == -np.inf] = log_floor
-
         self.n_components = model.n_components
         
         self.masked_word = "_" * word_len
@@ -233,6 +240,7 @@ class HangmanEnv(gym.Env):
         return initial_state, info
 
     def step(self, action):
+        # (This function is unchanged, with the +15 / -5 rewards)
         letter = self.alphabet[action]
         
         if letter in self.guessed_letters:
@@ -245,11 +253,7 @@ class HangmanEnv(gym.Env):
         self.guessed_letters.add(letter)
 
         if letter in self.secret_word:
-            # --- THIS IS THE FIRST CHANGE ---
-            # We default the reward to +15 for a correct guess
-            reward = 15  # <-- WAS +5. Aggressively reward progress.
-            # --- END CHANGE ---
-            
+            reward = 15  # <-- Correct +15 reward
             new_masked_word = list(self.masked_word)
             for i, char in enumerate(self.secret_word):
                 if char == letter:
@@ -257,22 +261,19 @@ class HangmanEnv(gym.Env):
             self.masked_word = "".join(new_masked_word)
             
             if "_" not in self.masked_word:
-                reward = 100  # Override with the win bonus
+                reward = 100
                 done = True
                 info = {"msg": "Game won!"}
             else:
                 done = False
-                # If it's not a win, the reward remains +15
                 info = {"msg": "Correct guess"}
         
         else:
-            # --- THIS IS THE SECOND CHANGE ---
             self.lives_left -= 1
-            reward = -5 # <-- WAS -10. Lessen the penalty.
-            # --- END CHANGE ---
+            reward = -5 # <-- Correct -5 reward
             
             if self.lives_left <= 0:
-                reward = -100 # Override with the loss penalty
+                reward = -100
                 done = True
                 info = {"msg": "Game lost!"}
             else:
@@ -283,18 +284,19 @@ class HangmanEnv(gym.Env):
         
         return new_state, reward, done, False, info
 
-# --- Test Block (Unchanged) ---
+# --- Test Block (Updated) ---
 if __name__ == "__main__":
     
-    print("Testing HangmanEnv with NEW 'Smarter State'...")
+    print("Testing HangmanEnv with FINAL 'Hybrid Intuition' State...")
     env = HangmanEnv(oracle_path="hmm_oracles.pkl", corpus_path="corpus.txt")
     
     state, info = env.reset()
     
     print(f"Game started. Secret word: {info['secret_word']}")
     print(f"Mask: {info['masked_word']}")
-    print(f"New state vector shape: {state.shape}")
+    print(f"Final state vector shape: {state.shape}")
     print(f"Calculated state size: {env.state_size}")
+    assert state.shape[0] == env.state_size, "State size mismatch!"
     
     action = env.action_space.sample()
     print(f"\nTaking random action: Guessing '{env.alphabet[action]}'")

@@ -6,18 +6,18 @@ import torch.nn.functional as F
 import numpy as np
 import random
 from collections import deque, namedtuple
-from hangman_env import HangmanEnv  # Our environment is perfect
+from hangman_env import HangmanEnv  # Import our FINAL environment
 import time
 
 # --- 1. Set Parameters ---
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
-# Hyperparameters (tuned for this new, complex network)
+# Hyperparameters
 BUFFER_SIZE = int(3e5)
 BATCH_SIZE = 128
 GAMMA = 0.99
-LR = 5e-5               # <-- We need a smaller LR for this big network
+LR = 5e-5               # Stay with the low LR
 TAU = 1e-3
 UPDATE_EVERY = 4
 
@@ -25,66 +25,52 @@ UPDATE_EVERY = 4
 EPS_START = 1.0
 EPS_END = 0.01
 EPS_DECAY = 0.999
-N_EPISODES = 20000      # It will need all 20k episodes
+N_EPISODES = 20000      # Use all 20k episodes
 
-# --- 2. Define the "Two-Tower" DQN ---
-
+# --- 2. Define the "Two-Tower" DQN (Unchanged, but now receives a larger stats_input) ---
 class DQN_TwoTower(nn.Module):
-    """
-    A Two-Tower DQN Architecture.
-    - Tower 1 (MLP) processes stats: (lives, guessed_mask, hmm_probs)
-    - Tower 2 (CNN) processes the word: (masked_word)
-    """
     def __init__(self, stats_size, word_len, word_encoding_size, action_size=26, seed=42):
         super(DQN_TwoTower, self).__init__()
         self.seed = torch.manual_seed(seed)
         
         # --- Tower 1: Stats MLP ---
-        # Input size = 1 (lives) + 26 (guessed) + 26 (hmm) = 53
+        # Input size is now 79 (1+26+26+26)
         self.stats_fc1 = nn.Linear(stats_size, 64)
         self.stats_fc2 = nn.Linear(64, 64)
         
         # --- Tower 2: Word 1D-CNN ---
-        # Input shape: (batch_size, word_len, 27-channels)
-        # We must swap to (batch_size, 27-channels, word_len) for CNN
         self.word_len = word_len
-        self.word_encoding_size = word_encoding_size # 27
-        
-        # (Channels_in, Channels_out, Kernel_size)
+        self.word_encoding_size = word_encoding_size
         self.conv1 = nn.Conv1d(self.word_encoding_size, 64, kernel_size=3, padding=1)
         self.conv2 = nn.Conv1d(64, 128, kernel_size=3, padding=1)
-        
-        # Calculate the flattened size after conv layers
-        # (Batch, 128 channels, word_len)
         self.cnn_output_size = 128 * self.word_len
         
         # --- Final Head: Combined Network ---
-        self.combined_fc1 = nn.Linear(64 + self.cnn_output_size, 256) # 64 (stats) + CNN (word)
+        self.combined_fc1 = nn.Linear(64 + self.cnn_output_size, 256)
         self.combined_fc2 = nn.Linear(256, 128)
         self.output = nn.Linear(128, action_size)
 
     def forward(self, state):
         # --- Split the state vector ---
-        # state is (batch_size, 701)
+        # state is (batch_size, 727)
         
-        # Stats Tower Input: (Batch, 53)
-        stats_input = state[:, :53]
+        # --- *** NEW SLICE *** ---
+        # Stats Tower Input: (Batch, 79)
+        stats_input = state[:, :79]
         
-        # Word Tower Input: (Batch, 648) -> (Batch, 24, 27)
-        word_input = state[:, 53:].reshape(-1, self.word_len, self.word_encoding_size)
-        # -> (Batch, 27, 24) for CNN
+        # Word Tower Input: (Batch, 648)
+        word_input = state[:, 79:].reshape(-1, self.word_len, self.word_encoding_size)
+        # --- *** END NEW SLICE *** ---
+        
         word_input = word_input.permute(0, 2, 1) 
         
-        # --- Process Tower 1 ---
         x_stats = F.relu(self.stats_fc1(stats_input))
-        x_stats = F.relu(self.stats_fc2(x_stats)) # (Batch, 64)
+        x_stats = F.relu(self.stats_fc2(x_stats))
         
-        # --- Process Tower 2 ---
         x_word = F.relu(self.conv1(word_input))
         x_word = F.relu(self.conv2(x_word))
-        x_word = x_word.reshape(-1, self.cnn_output_size) # (Batch, 3072)
+        x_word = x_word.reshape(-1, self.cnn_output_size)
         
-        # --- Combine and Process Head ---
         x_combined = torch.cat((x_stats, x_word), dim=1)
         
         x = F.relu(self.combined_fc1(x_combined))
@@ -98,7 +84,6 @@ class ReplayBuffer:
         self.batch_size = batch_size
         self.experience = namedtuple("Experience", field_names=["state", "action", "reward", "next_state", "done"])
         self.seed = random.seed(seed)
-    # ... (add, sample, __len__ methods are identical) ...
     def add(self, state, action, reward, next_state, done):
         e = self.experience(state, action, reward, next_state, done)
         self.memory.append(e)
@@ -112,19 +97,18 @@ class ReplayBuffer:
         return (states, actions, rewards, next_states, dones)
     def __len__(self):
         return len(self.memory)
-# --- 4. Define the Agent ---
 
+# --- 4. Define the Agent (Unchanged logic, just new params) ---
 class DQNAgent:
-    def __init__(self, state_size, action_size, word_len, word_encoding_size, seed=42):
+    def __init__(self, state_size, action_size, stats_size, word_len, word_encoding_size, seed=42):
         self.state_size = state_size
         self.action_size = action_size
         self.seed = random.seed(seed)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # --- Pass all sizes to the new Two-Tower network ---
-        self.stats_size = 1 + 26 + 26 # 53
+        self.stats_size = stats_size
         self.word_len = word_len
-        self.word_encoding_size = word_encoding_size # 27
+        self.word_encoding_size = word_encoding_size
 
         self.qnetwork_local = DQN_TwoTower(self.stats_size, self.word_len, self.word_encoding_size, action_size, seed).to(self.device)
         self.qnetwork_target = DQN_TwoTower(self.stats_size, self.word_len, self.word_encoding_size, action_size, seed).to(self.device)
@@ -142,8 +126,11 @@ class DQNAgent:
                 self.learn(experiences, GAMMA)
 
     def act(self, state, eps=0.):
-        # Action Masking is identical
-        guessed_mask = state[1:27]
+        # --- *** NEW SLICE *** ---
+        # state[1:27] is still the guessed_mask
+        guessed_mask = state[1:27] 
+        # --- *** END NEW SLICE *** ---
+        
         state_tensor = torch.from_numpy(state).float().unsqueeze(0).to(self.device)
         
         self.qnetwork_local.eval()
@@ -163,7 +150,6 @@ class DQNAgent:
                 return 0
 
     def learn(self, experiences, gamma):
-        # Learn logic is identical
         states, actions, rewards, next_states, dones = experiences
         Q_targets_next = self.qnetwork_target(next_states).detach().max(1)[0].unsqueeze(1)
         Q_targets = rewards + (gamma * Q_targets_next * (1 - dones))
@@ -175,23 +161,24 @@ class DQNAgent:
         self.soft_update(self.qnetwork_local, self.qnetwork_target, TAU)
 
     def soft_update(self, local_model, target_model, tau):
-        # Soft update logic is identical
         for target_param, local_param in zip(target_model.parameters(), local_model.parameters()):
             target_param.data.copy_(tau*local_param.data + (1.0-tau)*target_param.data)
 
 # --- 5. The Training Loop ---
 def train():
-    # --- Get environment parameters ---
+    # --- Get FINAL environment parameters ---
     env = HangmanEnv()
     state_size = env.observation_space.shape[0]
     action_size = env.action_space.n
+    stats_size = env.stats_size
     word_len = env.max_word_len
-    word_encoding_size = env.letter_encoding_size # 27
+    word_encoding_size = env.letter_encoding_size
     
     # --- Pass all params to the new Agent ---
     agent = DQNAgent(
         state_size=state_size, 
         action_size=action_size, 
+        stats_size=stats_size,
         word_len=word_len, 
         word_encoding_size=word_encoding_size
     )
@@ -204,7 +191,7 @@ def train():
     wins_window = deque(maxlen=100)
     eps = EPS_START
     
-    print(f"\n--- Starting Training (Two-Tower Network) ---")
+    print(f"\n--- Starting Training (Final Agent) ---")
     print(f"Will train for {N_EPISODES} episodes.")
     start_time = time.time()
 
@@ -234,13 +221,13 @@ def train():
             print(f"Ep {i_episode}\tAvg Score: {avg_score:.2f}\tWin Rate: {win_rate:.1f}%\tEps: {eps:.4f}\tTime: {elapsed:.0f}s")
             
         if i_episode % 2000 == 0:
-            save_path = f"dqn_agent_twotower_ep{i_episode}.pth"
+            save_path = f"dqn_agent_final_ep{i_episode}.pth"
             torch.save(agent.qnetwork_local.state_dict(), save_path)
             print(f"*** Model saved to {save_path} ***")
 
     print("\n--- Training Complete ---")
     torch.save(agent.qnetwork_local.state_dict(), "dqn_agent_final.pth")
-    print("Final model (two_tower) saved to dqn_agent_final.pth")
+    print("Final model (final_agent) saved to dqn_agent_final.pth")
     
     return scores
 
@@ -254,7 +241,7 @@ if __name__ == "__main__":
         plt.plot(np.arange(len(scores)), scores)
         plt.ylabel('Score')
         plt.xlabel('Episode #')
-        plt.title('DQN Training Performance (Two-Tower)')
+        plt.title('DQN Training Performance (Final Agent)')
         plt.savefig("training_plot.png")
         print("Training plot saved to training_plot.png")
     except ImportError:
